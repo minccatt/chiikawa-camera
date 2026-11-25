@@ -15,6 +15,7 @@ button:disabled,select:disabled{opacity:.45;cursor:default}.primary{background:#
 .screen{position:relative;display:grid;place-items:center;width:min(100%,850px);aspect-ratio:3/2;max-height:57vh;margin:12px auto;background:#ebe6df;border-radius:18px;overflow:hidden;color:#81766c}
 video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:none!important}
 #count{position:absolute;inset:0;display:grid;place-items:center;font-size:clamp(70px,16vw,140px);font-weight:900;color:white;text-shadow:0 2px 18px #000;pointer-events:none}#status{min-height:1.6em}.error{color:#b33c36}#take{min-width:200px;font-size:19px}
+html,body{height:100%;overflow:hidden}body{padding:8px;overscroll-behavior:none}main{height:100%;max-width:1350px;margin:0 auto;padding:12px;display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto auto;gap:8px;min-height:0}h1,p{margin:0}h1{font-size:clamp(20px,3.6vh,32px)}.screen{width:100%;height:100%;min-height:0;aspect-ratio:auto;max-height:none;margin:0}video{min-width:0;min-height:0}button,select{padding:9px 14px;min-height:40px}select{max-width:min(480px,56vw)}#status{font-size:13px;overflow-wrap:anywhere}.note{font-size:12px}#take{min-width:150px}@media(max-height:550px){main{padding:8px;gap:5px}button,select{padding:6px 10px;min-height:34px}h1{font-size:20px}.note{font-size:11px}}
 </style>
 </head>
 <body>
@@ -22,7 +23,7 @@ video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:n
   <h1>📷 사진 촬영</h1>
   <div class="row">
     <select id="device" aria-label="카메라 선택"><option value="">기본 카메라</option></select>
-    <button id="start">카메라 시작 / 전환</button>
+    <button id="start">다시 연결</button><button id="preferred" title="현재 선택한 카메라를 다음 촬영부터 기본으로 사용">기본 웹캠으로 지정</button>
   </div>
   <p id="status" role="status" aria-live="polite">카메라 연결 중…</p>
   <div class="screen">
@@ -35,7 +36,7 @@ video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:n
     <button class="primary" id="take" disabled>3초 후 촬영</button>
     <button id="fallback" hidden>촬영 사진 다운로드</button>
   </div>
-  <p>촬영한 사진은 브라우저에서 생성기로 직접 전달돼요.</p>
+  <p class="note">촬영한 사진은 브라우저에서 생성기로 직접 전달돼요.</p>
 </main>
 <script>
 (() => {
@@ -54,7 +55,7 @@ video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:n
     video.srcObject=null;$('take').disabled=true;
     video.hidden=true;$('placeholder').hidden=false;
   }
-  function controls(on){$('start').disabled=on;$('device').disabled=on;$('take').disabled=on||!stream||!video.videoWidth;}
+  function controls(on){$('start').disabled=on;$('device').disabled=on;$('preferred').disabled=on||!stream||!$('device').value;$('take').disabled=on||!stream||!video.videoWidth;}
   function describe(error){
     switch(error&&error.name){
       case 'NotAllowedError':return '카메라 권한이 거부됐어요. 주소창의 사이트 설정에서 카메라를 허용하고 다시 시작해 주세요.';
@@ -64,40 +65,59 @@ video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:n
       default:return '카메라 연결 실패: '+(error.message||String(error));
     }
   }
-  async function connect(){
+  const preferenceKey='chiikawa.preferredCamera.v1';
+  function remembered(){try{return JSON.parse(localStorage.getItem(preferenceKey)||'null');}catch(e){return null;}}
+  function integrated(d){return /integrated|built[ -]?in|internal|facetime|내장|노트북|laptop|front camera|user facing/i.test(d.label);}
+  function external(d){return !integrated(d)&&/external|외장|usb|logitech|logi\b|c920|c922|c930|brio|lifecam|razer|elgato|avermedia|anker|obsbot|webcam|web cam|웹캠/i.test(d.label);}
+  function orderDevices(devices,actual){
+    const saved=remembered(), preferred=devices.find(d=>saved&&(d.deviceId===saved.id||(saved.label&&d.label===saved.label)));
+    const recognized=devices.find(d=>external(d));
+    const other=devices.some(integrated)?devices.find(d=>!integrated(d)&&d.label):null;
+    const first=(preferred&&!integrated(preferred)?preferred:null)||recognized||other||preferred||devices.find(d=>d.deviceId===actual)||devices[0];
+    return first?[first,...devices.filter(d=>d!==first)]:devices;
+  }
+  function listDevices(devices,actual){const ordered=orderDevices(devices,actual);$('device').replaceChildren();ordered.forEach((d,i)=>{const label=d.label||('카메라 '+(i+1));$('device').add(new Option(label+(i===0?' (기본)':''),d.deviceId));});if(!ordered.length)$('device').add(new Option('기본 카메라',''));$('device').value=ordered.some(d=>d.deviceId===actual)?actual:ordered[0]?.deviceId||'';return ordered;}
+  async function acquire(id){return navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:1280},height:{ideal:960},...(id?{deviceId:{exact:id}}:{facingMode:'user'})}});}
+  async function connect(auto=false){
     if(capturing)return;
+    const requested=auto?'':$('device').value;
     photo='';$('fallback').hidden=true;release();
     const token=generation;
     controls(true);say('카메라 연결 중… 권한 요청이 뜨면 허용해 주세요.');
+    let candidate=null;
     try{
       if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia)throw Error('HTTPS 주소에서 촬영 페이지를 열어 주세요.');
-      const id=$('device').value;
-      const candidate=await navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:1280},height:{ideal:960},...(id?{deviceId:{exact:id}}:{facingMode:'user'})}});
-      if(token!==generation){candidate.getTracks().forEach(track=>track.stop());return;}
-      stream=candidate;video.srcObject=stream;
-      await video.play();
-      if(token!==generation)return;
-      video.hidden=false;$('placeholder').hidden=true;
-      say(linked?'카메라 연결 성공! 촬영 버튼을 눌러 주세요.':'카메라 연결 성공! 현재는 단독 테스트 모드예요.');
-      const track=stream.getVideoTracks()[0];
-      track.addEventListener('ended',()=>{if(token===generation){release();controls(false);say('카메라 연결이 끊겼어요. 다시 시작해 주세요.',true);}});
-      try{
-        const devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
-        if(token!==generation)return;
-        const actual=track.getSettings().deviceId||id;
-        $('device').replaceChildren(new Option('기본 카메라',''));
-        devices.forEach((d,i)=>{if(d.deviceId)$('device').add(new Option(d.label||('카메라 '+(i+1)),d.deviceId));});
-        $('device').value=devices.some(d=>d.deviceId===actual)?actual:'';
-      }catch(e){/* camera can still be used */}
-    }catch(e){if(token===generation){release();say(describe(e),true);}}
-    finally{if(!capturing)controls(false);}
+      // Browser permission may hide device labels; unlock it before picking the default.
+      let devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput'&&d.deviceId);
+      let id=requested;
+      if(auto&&devices.some(d=>d.label))id=orderDevices(devices,'')[0]?.deviceId||'';
+      try{candidate=await acquire(id);}catch(e){if(!auto||!id)throw e;candidate=await acquire('');}
+      if(token!==generation){candidate.getTracks().forEach(t=>t.stop());return;}
+      let actual=candidate.getVideoTracks()[0].getSettings().deviceId||id;
+      try{devices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput'&&d.deviceId);}catch(e){}
+      if(token!==generation){candidate.getTracks().forEach(t=>t.stop());return;}
+      const preferred=orderDevices(devices,actual)[0]?.deviceId;
+      if(auto&&preferred&&preferred!==actual){
+        candidate.getTracks().forEach(t=>t.stop());candidate=null;
+        try{candidate=await acquire(preferred);actual=candidate.getVideoTracks()[0].getSettings().deviceId||preferred;}
+        catch(e){candidate=await acquire(actual);actual=candidate.getVideoTracks()[0].getSettings().deviceId||actual;}
+      }
+      if(token!==generation){candidate.getTracks().forEach(t=>t.stop());return;}
+      stream=candidate;video.srcObject=stream;await video.play();if(token!==generation)return;
+      listDevices(devices,actual);video.hidden=false;$('placeholder').hidden=true;
+      const label=$('device').selectedOptions[0]?.textContent||'카메라';
+      say(label+' 연결 성공! '+(linked?'촬영 버튼을 눌러 주세요.':'단독 테스트 모드예요.'));
+      stream.getVideoTracks()[0].addEventListener('ended',()=>{if(token===generation){release();controls(false);say('카메라 연결이 끊겼어요. 다시 연결해 주세요.',true);}});
+    }catch(e){if(candidate&&candidate!==stream)candidate.getTracks().forEach(t=>t.stop());if(token===generation){release();say(describe(e),true);}}
+    finally{if(!capturing&&token===generation)controls(false);else if(!capturing&&!stream)controls(false);}
   }
+  $('preferred').onclick=()=>{const track=stream?.getVideoTracks()[0];if(!track)return;const id=track.getSettings().deviceId||$('device').value,label=track.label;try{localStorage.setItem(preferenceKey,JSON.stringify({id,label}));}catch(e){say('브라우저에서 기본값 저장을 허용하지 않았어요.',true);return;}navigator.mediaDevices.enumerateDevices().then(devices=>{listDevices(devices.filter(d=>d.kind==='videoinput'&&d.deviceId),id);say(label+'을 기본 웹캠으로 지정했어요.');}).catch(()=>say('기본 웹캠을 저장했어요.'));};
   function download(){
     if(!photo)return;
     const a=document.createElement('a');a.href=photo;a.download='chiikawa_capture.jpg';document.body.append(a);a.click();a.remove();
   }
   $('fallback').onclick=download;
-  $('start').onclick=connect;$('device').onchange=connect;
+  $('start').onclick=()=>connect(false);$('device').onchange=()=>connect(false);
   video.addEventListener('loadeddata',()=>{if(!capturing&&stream)$('take').disabled=false;});
   $('take').onclick=async()=>{
     if(capturing||!stream||!video.videoWidth)return;
@@ -134,7 +154,7 @@ video{display:block;width:100%;height:100%;object-fit:contain}[hidden]{display:n
     window.close();say('촬영을 취소했어요. 이 창을 닫아 주세요.');
   };
   window.addEventListener('pagehide',release);
-  connect();
+  connect(true);
 })();
 </script>
 </body>
